@@ -1,0 +1,267 @@
+import cv2
+from PIL import Image
+import numpy as np
+from util import get_limits
+import RPi.GPIO as GPIO
+import time
+import sys
+
+# -----------------------
+# GPIO / MOTOR SETUP
+# -----------------------
+LEFT_PIN = 18# left motor PWM pin (BCM)
+RIGHT_PIN = 17 # right motor PWM pin (BCM)
+PWM_FREQ = 30# Hz
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LEFT_PIN, GPIO.OUT)
+GPIO.setup(RIGHT_PIN, GPIO.OUT)
+
+left_pwm = GPIO.PWM(LEFT_PIN, PWM_FREQ)
+right_pwm = GPIO.PWM(RIGHT_PIN, PWM_FREQ)
+
+left_pwm.start(0.0)
+right_pwm.start(0.0)
+
+def set_motors(left_duty, right_duty):
+    left_duty = max(0.0, min(100.0, left_duty))
+    right_duty = max(0.0, min(100.0, right_duty))
+    left_pwm.ChangeDutyCycle(left_duty)
+    right_pwm.ChangeDutyCycle(right_duty)
+
+def stop_motors():
+    set_motors(0.0, 0.0)
+
+# -----------------------
+# TRACKER FALLBACK SYSTEM
+# -----------------------
+def create_best_tracker():
+    tracker_candidates = [
+        ("CSRT",  lambda: cv2.TrackerCSRT_create()),
+        ("KCF",   lambda: cv2.TrackerKCF_create()),
+        ("MOSSE", lambda: cv2.legacy.TrackerMOSSE_create()),
+        ("MIL",   lambda: cv2.TrackerMIL_create()),
+    ]
+
+    for name, creator in tracker_candidates:
+        try:
+            tracker = creator()
+            print(f"[INFO] Using tracker: {name}")
+            return tracker
+        except Exception:
+            continue
+
+    raise RuntimeError("No supported trackers found in this OpenCV build.")
+
+# -----------------------
+# UTILS
+# -----------------------
+def iou(boxA, boxB):
+    """Compute IoU between two boxes given as (x,y,w,h). Returns 0..1."""
+    if boxA is None or boxB is None:
+        return 0.0
+    (xA, yA, wA, hA) = boxA
+    (xB, yB, wB, hB) = boxB
+    x1A, y1A, x2A, y2A = xA, yA, xA + wA, yA + hA
+    x1B, y1B, x2B, y2B = xB, yB, xB + wB, yB + hB
+
+    inter_x1 = max(x1A, x1B)
+    inter_y1 = max(y1A, y1B)
+    inter_x2 = min(x2A, x2B)
+    inter_y2 = min(y2A, y2B)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    areaA = wA * hA
+    areaB = wB * hB
+
+    union = areaA + areaB - inter_area
+    if union == 0:
+        return 0.0
+    return inter_area / union
+
+# -----------------------
+# COLOR & CAMERA SETUP
+# -----------------------
+target_color = [255, 0, 200]  # neon magenta in BGR
+
+cap = cv2.VideoCapture(0)
+ret, frame = cap.read()
+if not ret:
+    print("Camera failed to open")
+    stop_motors()
+    GPIO.cleanup()
+    exit(1)
+
+H, W, _ = frame.shape
+roi_width = W // 3
+roi_x1 = (W - roi_width) // 2
+roi_x2 = roi_x1 + roi_width
+roi_center = ((roi_x1 + roi_x2) // 2, H // 2)
+
+tracker = None
+tracking = False
+
+# Motor control params
+BASE_DUTY = 50.0         # baseline duty when target is locked
+MAX_CORRECTION = 30.0    # maximum differential correction in percent
+DEADZONE_PIXELS = 10     # deadzone around center where no correction applied
+IOU_LOSS_THRESHOLD = 0.20  # below this IoU we'll consider the object lost
+
+def compute_differential(error_x):
+    half_width = W / 2.0
+    norm = error_x / half_width
+    norm = max(-1.0, min(1.0, norm))
+    correction = norm * MAX_CORRECTION
+    return correction
+
+print("[INFO] Starting main loop. Press 'q' to quit.")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] frame read failed, stopping.")
+            break
+
+        hsvImage = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lowerLimit, upperLimit = get_limits(color=target_color)
+        mask = cv2.inRange(hsvImage, lowerLimit, upperLimit)
+
+        # Clean mask noise
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        # Convert mask to PIL for bbox
+        mask_ = Image.fromarray(mask)
+        mask_bbox = mask_.getbbox()  # returns (x1,y1,x2,y2) or None
+
+        # Normalize mask bbox to (x,y,w,h) if present
+        if mask_bbox is not None:
+            mx1, my1, mx2, my2 = mask_bbox
+            m_w = mx2 - mx1
+            m_h = my2 - my1
+            mask_box_xywh = (mx1, my1, m_w, m_h)
+        else:
+            mask_box_xywh = None
+
+        # -----------------------------------------
+        # SEARCH MODE
+        # -----------------------------------------
+        if not tracking:
+            # Ensure motors are stopped while no target is present
+            stop_motors()
+
+            # Lock whenever a valid color blob is detected (no ROI gate)
+            if mask_box_xywh is not None:
+                x1, y1, w, h = mask_box_xywh  # mask's detected box (x,y,w,h)
+                # Filter out tiny blobs
+                if w > 25 and h > 25:
+                    try:
+                        # initialize tracker with mask box (x,y,w,h)
+                        tracker = create_best_tracker()
+                        tracker.init(frame, (x1, y1, w, h))
+                        tracking = True
+                        print("[INFO] Target locked! Motors starting at base duty.")
+                        set_motors(BASE_DUTY, BASE_DUTY)
+                    except Exception as e:
+                        print("[ERROR] Failed to initialize tracker:", e)
+
+        # -----------------------------------------
+        # TRACK MODE
+        # -----------------------------------------
+        else:
+            success, box = tracker.update(frame)
+
+            if not success:
+                print("[INFO] Tracker returned failure -> switching to search.")
+                tracking = False
+                tracker = None
+                stop_motors()
+                continue
+
+            (x, y, w, h) = [int(v) for v in box]
+            obj_center = (x + w // 2, y + h // 2)
+
+            # Check if tracked box leaves frame bounds
+            if x < 0 or y < 0 or (x + w) > W or (y + h) > H:
+                print("[INFO] Object partially moved out of frame â€” stopping motors & switching to search.")
+                tracking = False
+                tracker = None
+                stop_motors()
+                continue
+
+            # Now check mask presence and IoU with mask
+            if mask_box_xywh is None:
+                # color no longer present in mask -> lost
+                print("[INFO] Color mask empty while tracker active -> treating as lost.")
+                tracking = False
+                tracker = None
+                stop_motors()
+                continue
+
+            current_iou = iou((x, y, w, h), mask_box_xywh)
+            if current_iou < IOU_LOSS_THRESHOLD:
+                print(f"[INFO] Low IoU ({current_iou:.3f}) between tracker and mask -> treating as lost.")
+                tracking = False
+                tracker = None
+                stop_motors()
+                continue
+
+            # If we reach here, tracking is considered valid
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.line(frame, roi_center, obj_center, (255, 255, 255), 2)
+
+            error_x = obj_center[0] - roi_center[0]
+            error_y = obj_center[1] - roi_center[1]
+            print("Error:", error_x, error_y, "IoU:", f"{current_iou:.3f}")
+
+            # Steering logic:
+            # 1) If object is inside the ROI rectangle -> drive straight (both motors base duty)
+            # 2) Else if within small deadzone -> drive straight
+            # 3) Else apply differential steering based on horizontal error
+            if roi_x1 <= obj_center[0] <= roi_x2:
+                left_duty = BASE_DUTY
+                right_duty = BASE_DUTY
+            elif abs(error_x) <= DEADZONE_PIXELS:
+                left_duty = BASE_DUTY
+                right_duty = BASE_DUTY
+            else:
+                correction = compute_differential(error_x)
+                left_duty = BASE_DUTY + correction
+                right_duty = BASE_DUTY - correction
+
+            left_duty = max(0.0, min(100.0, left_duty))
+            right_duty = max(0.0, min(100.0, right_duty))
+            set_motors(left_duty, right_duty)
+
+        # Draw ROI & displays
+        cv2.rectangle(frame, (roi_x1, 0), (roi_x2, H), (255, 0, 0), 2)
+
+        cv2.imshow("Tracking", frame)
+        cv2.imshow("Mask", mask)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            print("[INFO] Quit requested.")
+            break
+        elif key == ord("c"):
+            print("[INFO] Manual unlock - stopping motors.")
+            tracking = False
+            tracker = None
+            stop_motors()
+
+except KeyboardInterrupt:
+    print("\n[INFO] KeyboardInterrupt received. Exiting...")
+
+finally:
+    stop_motors()
+    left_pwm.stop()
+    right_pwm.stop()
+    GPIO.cleanup()
+    cap.release()
+    cv2.destroyAllWindows()
+    sys.exit(0)
