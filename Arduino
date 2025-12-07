@@ -1,0 +1,251 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+
+#define SS_PIN 10
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// Bluetooth pins
+#define BT_RX_PIN 2
+#define BT_TX_PIN 3
+SoftwareSerial BT(BT_RX_PIN, BT_TX_PIN);
+
+// LCD (I2C)
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // change to 0x3F if 0x27 doesn't work
+
+// PRODUCT DATABASE -----------------------------------
+struct Item {
+  String uid;
+  String name;
+  int price;
+};
+
+Item products[] = {
+  {"B3861AE5", "Dairy Milk", 45},
+  {"04F1FA03", "Amul Butter", 58},
+  {"B3C8BEE4", "Colgate", 110},
+  {"63B5C12C", "Lays", 20},
+  {"56A14B23", "Maggi", 14},
+  {"88CD429A", "Parle-G", 10}
+};
+
+const int PRODUCT_COUNT = 6;
+
+// Cart Storage ---------------------------------------
+const byte MAX_CART_ITEMS = 10;        // reduced from 50 to save RAM
+String cartName[MAX_CART_ITEMS];
+int cartPrice[MAX_CART_ITEMS], quantity[MAX_CART_ITEMS];
+int cartCount = 0, total = 0;
+
+// Fetch Product by UID --------------------------------
+bool getProduct(String uid, String &name, int &price) {
+  for (int i = 0; i < PRODUCT_COUNT; i++) {
+    if (uid == products[i].uid) {
+      name  = products[i].name;
+      price = products[i].price;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Add item to cart -------------------------------------
+void addToCart(String n, int p) {
+  // If already in cart, increase quantity
+  for (int i = 0; i < cartCount; i++) {
+    if (cartName[i] == n) {
+      quantity[i]++;
+      total += p;
+      return;
+    }
+  }
+
+  // If new and there's space
+  if (cartCount < MAX_CART_ITEMS) {
+    cartName[cartCount]  = n;
+    cartPrice[cartCount] = p;
+    quantity[cartCount]  = 1;
+    cartCount++;
+    total += p;
+  } else {
+    // Cart full – notify
+    Serial.println(F("Cart full, cannot add more items"));
+    BT.println(F("Cart full, cannot add more items"));
+  }
+}
+
+// Remove last item -------------------------------------
+void removeLast() {
+  if (cartCount == 0) return;
+  total -= cartPrice[cartCount - 1];
+  quantity[cartCount - 1]--;
+  if (quantity[cartCount - 1] == 0) cartCount--;
+}
+
+// Clear cart -------------------------------------------
+void clearCart() {
+  cartCount = 0;
+  total     = 0;
+}
+
+// FINAL BILL -------------------------------------------
+void showFinalBill() {
+  Serial.println(F("\n======== FINAL BILL ========"));
+  BT.println(F("\n======== FINAL BILL ========"));
+
+  for (int i = 0; i < cartCount; i++) {
+    String line = String(i + 1) + ") " + cartName[i] + " x" + quantity[i] +
+                  " = Rs " + String(cartPrice[i] * quantity[i]);
+    Serial.println(line);
+    BT.println(line);
+  }
+
+  Serial.println(F("----------------------------"));
+  Serial.println("GRAND TOTAL = Rs " + String(total));
+  Serial.println(F("============================"));
+
+  BT.println(F("----------------------------"));
+  BT.println("GRAND TOTAL = Rs " + String(total));
+  BT.println(F("============================"));
+
+  // -------- LCD FINAL BILL --------
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("FINAL BILL:");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Total: Rs ");
+  lcd.print(total);
+}
+
+// Normal cart view (summary) ---------------------------
+void showCart() {
+  Serial.println(F("\nCART UPDATED"));
+  BT.println(F("\nCART UPDATED"));
+  Serial.println("TOTAL = Rs " + String(total));
+  BT.println("TOTAL = Rs " + String(total));
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Items: ");
+  lcd.print(cartCount);
+
+  lcd.setCursor(0, 1);
+  lcd.print("Total: Rs ");
+  lcd.print(total);
+}
+
+// Command Handler ---------------------------------------
+void processCommand(char c) {
+  if (c == '1') {
+    // View Bill
+    showFinalBill();
+  }
+  else if (c == '2') {
+    // Remove Last & show bill
+    removeLast();
+    BT.println(F("Removed Last Item"));
+    Serial.println(F("Removed Last Item"));
+    showFinalBill();
+  }
+  else if (c == '3') {
+    // Clear Cart & show bill
+    clearCart();
+    BT.println(F("Cart Cleared"));
+    Serial.println(F("Cart Cleared"));
+    showFinalBill();
+  }
+}
+
+// =======================================================
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SMART CART READY");
+  lcd.setCursor(0, 1);
+  lcd.print("Scan a product");
+  delay(1200);
+
+  Serial.println(F("SMART CART READY"));
+  BT.println(F("SMART CART READY"));
+
+  // Bluetooth menu options
+  BT.println(F("Commands:"));
+  BT.println(F("[1] View Bill"));
+  BT.println(F("[2] Remove Last"));
+  BT.println(F("[3] Clear Cart"));
+
+  Serial.println(F("Commands:"));
+  Serial.println(F("[1] View Bill"));
+  Serial.println(F("[2] Remove Last"));
+  Serial.println(F("[3] Clear Cart"));
+}
+
+// =======================================================
+void loop() {
+
+  // Bluetooth & Serial Commands
+  if (Serial.available()) processCommand(Serial.read());
+  if (BT.available())     processCommand(BT.read());
+
+  // RFID Detection
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  String UID = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) UID += "0";
+    UID += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  UID.toUpperCase();
+
+  // Debug: show UID in Serial/Bluetooth
+  Serial.print(F("Scanned UID: "));
+  Serial.println(UID);
+  BT.print(F("Scanned UID: "));
+  BT.println(UID);
+
+  String name;
+  int price;
+
+  if (getProduct(UID, name, price)) {
+    addToCart(name, price);
+
+    BT.println("\nAdded: " + name + "  Rs " + String(price));
+    Serial.println("\nAdded: " + name + "  Rs " + String(price));
+
+    // Show last added on LCD briefly
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Added:");
+    lcd.print(name);
+    lcd.setCursor(0, 1);
+    lcd.print("Rs ");
+    lcd.print(price);
+    delay(800);
+  }
+  else {
+    BT.println("Unknown Tag: " + UID);
+    Serial.println("Unknown Tag: " + UID);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("UNKNOWN TAG");
+    delay(800);
+  }
+
+  // Then show updated cart summary
+  showCart();
+
+  rfid.PICC_HaltA();
+}
